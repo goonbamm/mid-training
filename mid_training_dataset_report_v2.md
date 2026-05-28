@@ -3,7 +3,7 @@
 **작성일**: 2026-05-26
 **대상**: 4B hybrid reasoning 모델 mid-training
 **토크나이저**: Gemma4 기준 (영문 ≈ 3.8 char/token, 코드 ≈ 3.0, JSON ≈ 3.3, 한국어 ≈ 1.8)
-**목표**: 일반 추론 30B 토큰 + 지시 수행 추론 30B 토큰
+**목표**: 일반 추론 30B 토큰 + 지시 수행 추론 30B 토큰 + **GenUI 특화 ~10B 토큰**(2026-05-28 신규 도메인, +증액 → 총 ~70B)
 
 ---
 
@@ -16,6 +16,7 @@
   - Llama 출력 합성 **거부** (Llama 3.1+ 라이센스 변경에도 모델명 prefix 제약 회피)
   - GPT-4o/GPT-4 출력은 비중 ≤ 5%, 보조 용도만
 - **Teacher 모델 분포**: DeepSeek-R1 ~35% / Qwen3·QwQ ~25% / gpt-oss-120B ~20% / GLM-5.1 ~8% / Kimi K2.5 ~8% / Human ~4%
+- **GenUI 특화 도메인 (2026-05-28 신규, +증액 ~10B → 총 ~70B)**: 코드 생성 + 구조화 렌더링, 텍스트 전용, thinking 포함. 공개 클린 데이터 ~700-800M(WebSight·WebGen·Nemotron-structured·Tessa-T1·Tesslate)이 한계 → **자체 합성(컴포넌트 트리·reasoning UI)이 필수**. 상세 §4.5
 - **Hybrid reasoning toggle 학습**의 3대 자산:
   1. [Jackrong/GLM-5.1-Reasoning-1M-Cleaned](https://huggingface.co/datasets/Jackrong/GLM-5.1-Reasoning-1M-Cleaned) — GLM-5.1의 명시적 `<think>` wrapping
   2. [nvidia/Nemotron-Math-v2](https://huggingface.co/datasets/nvidia/Nemotron-Math-v2) AoPS subset — gpt-oss-120B의 6가지 reasoning mode (high/med/low × TIR on/off)
@@ -67,12 +68,24 @@
 - **일반**: BBH, ZebraLogic, ARC-Challenge, MuSR
 - **Agent**: BFCL v3 test, ToolHop, GAIA, tau2-bench
 - **IF**: IFEval test, IFBench test, FollowBench, ComplexBench test
+- **GenUI/Web** (2026-05-28 추가): WebDev Arena ([lmarena-ai/webdev-arena-preference-10k](https://huggingface.co/datasets/lmarena-ai/webdev-arena-preference-10k) — **최우선**, 실제 프롬프트+모델 코드), Design2Code ([SALT-NLP/Design2Code](https://huggingface.co/datasets/SALT-NLP/Design2Code) + Design2Code-HARD + -hf), Sketch2Code ([SALT-NLP/Sketch2Code](https://huggingface.co/datasets/SALT-NLP/Sketch2Code)), Web2Code eval split([MBZUAI/Web2Code](https://huggingface.co/datasets/MBZUAI/Web2Code) 5,990 + 흡수된 Pix2Code), WebCode2M([xcodemind/webcode2m](https://huggingface.co/datasets/xcodemind/webcode2m), fuzzy), WebGen-Bench(eval 101 instruction), DesignBench(WebPAI/DesignBench), WebBench·Interaction2Code(GitHub 코드 타깃), 2025-26 신규(WebCoderBench/IWR-Bench/WebGen-V — HF 공개 시)
+  - 이미지 기반 벤치마크라도 **HTML/코드 타깃이 학습에 누출**될 수 있으므로 코드 타깃 기준 8-gram + fuzzy 매칭 차단.
 
 도구: [datatrove](https://github.com/huggingface/datatrove) MinHash + open-r1 decontamination 스크립트.
 
 ---
 
-## 2. 60B 토큰 분배 (확정)
+## 2. 토큰 분배 (60B + GenUI ~10B = ~70B)
+
+> **2026-05-28**: 기존 60B(일반추론 30B + IF 30B)에 **GenUI 특화 ~10B 신규 도메인 +증액**. 상세는 §4.5.
+
+### GenUI 특화 ~10B (신규)
+| Sub-domain | 토큰 | 비중 |
+|---|---|---|
+| 프론트엔드 코드 생성 (instruction→code) | 4B | 40% |
+| UI reasoning (think→code, hybrid toggle) | 3B | 30% |
+| 구조화 UI / 컴포넌트 트리 (자체 합성 중심) | 2B | 20% |
+| SVG / 차트 / data-viz spec | 1B | 10% |
 
 ### 일반 추론 30B
 | Sub-domain | 토큰 | 비중 | 근거 |
@@ -225,6 +238,100 @@
 
 ---
 
+## 4.5 GenUI 특화 도메인 (신규 도메인 · 토큰 증액, 2026-05-28 추가)
+
+> **결정 (2026-05-28 사용자)**: GenUI 특화 모델이므로 GenUI를 **신규 top-level 도메인**으로 신설하고 총 예산을 **+증액**. 범위는 **(1) 프론트엔드 코드 생성 + (2) 구조화 UI 렌더링 둘 다**, **텍스트 전용**(vision/screenshot 입력 제외), **thinking 트레이스 포함**(hybrid toggle 정렬 — 쉬운 UI는 짧게/없이, 복잡한 UI는 길게 추론). 라이센스·생성모델·decontamination 정책은 §1 그대로 적용.
+
+### 4.5.0 핵심 발견 (먼저 읽을 것)
+
+1. **진짜 "generative-UI" 공개 데이터는 사실상 없음.** 런타임 렌더링용 JSON 컴포넌트 트리 / AI-SDK·RSC generative-UI / tool→component 형태의 공개 클린 데이터셋은 검색 결과 부재(대부분 vision UI-detection으로 귀결). → **이 하위 카테고리는 자체 합성이 유일한 현실적 경로.**
+2. **추론+UI 데이터의 최대 자산(Tesslate 계열)은 라이센스는 깨끗(apache-2.0)하나 teacher(생성) 모델이 카드에 비공개.** 정책상 "생성모델 verbatim 기록 + Llama/closed-source 거부"를 엄격 적용하려면 **teacher 확인 전까지 조건부**. (단 `Tesslate/Tessa-T1-Dataset`만 "based on Qwen2.5-Coder" 명시 — 유일한 무결점 S.)
+3. **즉시 채택 가능한 무결점 클린 자산**: `HuggingFaceM4/WebSight`(Mistral-7B + DeepSeek-Coder-33B), `luzimu/WebGen-Bench_train_data`(DeepSeek-V3), `nvidia/Nemotron-Instruction-Following-Chat-v1` structured_outputs(gpt-oss-120B + Qwen3), `Tesslate/Tessa-T1-Dataset`(Qwen2.5-Coder).
+4. **클린 instruction/reasoning 공개 데이터는 현실적으로 ~700-800M에 그침.** 나머지는 web 코드 pretrain corpus(permissive 필터, the-stack-v2/stack-edu/webcode2m) + 자체 합성 + 고품질셋 oversampling으로 채움.
+
+### 4.5.1 GenUI 토큰 예산 (제안 ~10B, 총 60B → ~70B)
+
+| Sub-domain | 토큰 | 구성 | 근거 |
+|---|---|---|---|
+| **A. 프론트엔드 코드 생성** (instruction→code) | 4B | WebSight text-side(cap 0.5B) + WebGen-Instruct + Tessa-T1/Tesslate direct + kalinkov + permissive web corpus(the-stack-v2/stack-edu HTML·CSS·JS·Vue·Svelte cap ~3B) | React/HTML/CSS/Tailwind 직접 생성 능력 |
+| **B. UI reasoning** (think→code, hybrid toggle) | 3B | Tesslate reasoning 클러스터 ~400M(teacher 검증 후) oversample 4-5× + 자체 합성 reasoning UI(gpt-oss-120B/Qwen3/GLM-4.6) ~1B | "쉬운 UI 짧게 / 복잡한 UI 길게" toggle 학습의 핵심 |
+| **C. 구조화 UI / 컴포넌트 트리** (generative-UI) | 2B | Nemotron structured_outputs(~3M) + xLAM tool→widget 보조 + **자체 합성 JSON 컴포넌트 트리 ~1.8B**(공개 데이터 부재) | AI-SDK/RSC 스타일 구조화 렌더링 |
+| **D. SVG / 차트 / data-viz spec** | 1B | svg-stack(라이센스 확정 시) + VisCode Vega-Lite·Mermaid·SVG 서브셋(코드만) + Text2Vis | SVG·차트·시각화 spec 생성 |
+
+> **현실 체크**: A~D 중 공개 클린 instruction/reasoning은 ~700-800M. 나머지 ~9B는 (i) permissive web 코드 corpus(instruction 없는 pretrain성), (ii) 자체 합성(B의 reasoning, C의 컴포넌트 트리, 한국어), (iii) 고품질셋 oversampling으로 충당. GenUI 비중을 더 키우려면 자체 합성 규모를 늘려야 함.
+
+### 4.5.2 A. 프론트엔드 코드 생성 후보
+
+| 데이터셋 | 라이센스 | 추정 토큰 | 생성 모델 | reasoning | 우선순위 |
+|---|---|---|---|---|---|
+| [Tesslate/Tessa-T1-Dataset](https://huggingface.co/datasets/Tesslate/Tessa-T1-Dataset) | apache-2.0 | ~7.7M | **Qwen2.5-Coder (명시)** | Yes | **S** (React+Tailwind 직격, 유일 무결점) |
+| [HuggingFaceM4/WebSight](https://huggingface.co/datasets/HuggingFaceM4/WebSight) text-side | CC-BY-4.0 | 960M 전량 → **cap 0.5B** | Mistral-7B(아이디어) + DeepSeek-Coder-33B(HTML) | No | **S** (대량 + 클린, 비전 불필요) |
+| [luzimu/WebGen-Bench_train_data](https://huggingface.co/datasets/luzimu/WebGen-Bench_train_data) (WebGen-Instruct) | MIT | ~5-15M | **DeepSeek-V3** | No(trajectory) | **S** (단 동명 eval과 분리·decontam 필수) |
+| [Tesslate/UIGEN-T2](https://huggingface.co/datasets/Tesslate/UIGEN-T2) | apache-2.0 | ~110-165M | **비공개(teacher)** | Yes | **S조건부** (teacher 확인 시 S) |
+| [Tesslate/Next.js-Dataset](https://huggingface.co/datasets/Tesslate/Next.js-Dataset) | apache-2.0 | ~116-130M | **비공개** | Yes | A조건부 (Next.js/SSR 추론) |
+| [kalinkov/tailwindcss_components](https://huggingface.co/datasets/kalinkov/tailwindcss_components) | apache-2.0 | ~2M | LLM 생성(추정) | No | A (Tailwind 컴포넌트, 소량) |
+| [cfahlgren1/react-code-instructions](https://huggingface.co/datasets/cfahlgren1/react-code-instructions) | MIT | ~150M(전체)/~75M(클린) | **혼합: Llama-3.1-70B/405B + DeepSeek-V3 + Qwen2.5-Coder-32B** | No | A (**`model` 컬럼으로 Llama 행 제외 필수**, DeepSeek/Qwen만) |
+| [HuggingFaceTB/stack-edu](https://huggingface.co/datasets/HuggingFaceTB/stack-edu) JS/TS | the-stack-v2 준용(permissive) | JS 11B + TS 3B(StarCoder tok) → web 선별·cap | 인간 코드(Llama는 필터링용일 뿐, 출력 아님 → brand 무관) | No | A (고품질 web 코드 backbone) |
+| [bigcode/the-stack-v2](https://huggingface.co/datasets/bigcode/the-stack-v2) HTML/CSS/JS/Vue/Svelte | other(permissive only) | 수십~수백 B → **강한 cap** | 인간 크롤 코드 | No | A (permissive 서브셋만, attribution, SWH 동의) |
+| [codeparrot/github-code](https://huggingface.co/datasets/codeparrot/github-code) (web, permissive 필터) | other(`licenses=` mit/apache/bsd만) | cap 필수 | 인간 GitHub 코드 | No | B (copyleft 제외, the-stack-v2와 중복 가능) |
+
+### 4.5.3 B. UI reasoning (think→code, hybrid toggle 핵심)
+
+| 데이터셋 | 라이센스 | 추정 토큰 | 생성 모델 | reasoning 구조 | 우선순위 |
+|---|---|---|---|---|---|
+| [Tesslate/UIGEN-T3-Dataset-Extended-Reasoning](https://huggingface.co/datasets/Tesslate/UIGEN-T3-Dataset-Extended-Reasoning) | apache-2.0 | ~106M | **비공개(teacher)** | **2단(Pre+Post) reasoning** — long-think 학습 최적 | **S조건부** |
+| [Tesslate/UIGEN-T2](https://huggingface.co/datasets/Tesslate/UIGEN-T2) | apache-2.0 | ~110-165M | 비공개 | prompt/reasoning/response | **S조건부** |
+| [Tesslate/UIGEN-T1.5-Dataset](https://huggingface.co/datasets/Tesslate/UIGEN-T1.5-Dataset) = [smirki/UIGEN-T1.1-TAILWIND](https://huggingface.co/datasets/smirki/UIGEN-T1.1-TAILWIND) | apache-2.0 | ~7-8M(중복) | 비공개 | reasoning | B조건부 |
+| [smirki/UI_Reasoning_Dataset](https://huggingface.co/datasets/smirki/UI_Reasoning_Dataset) | MIT | ~3.6M | 비공개 | reasoning | B조건부 |
+| **자체 합성** reasoning UI (gpt-oss-120B / Qwen3 / GLM-4.6) | 자체 | ~1B | gpt-oss-120B/Qwen3/GLM-4.6 | `<think>` 레이아웃/접근성/상태관리 추론 → 코드 | **S** (teacher 검증 회피 + toggle 라벨 직접 제어) |
+
+> **Tesslate 클러스터 합계 ~300-400M(raw).** teacher 검증 시 oversample하여 B의 핵심. 미검증 시 보수적으로 제외하고 자체 합성으로 대체.
+
+### 4.5.4 C. 구조화 UI / 컴포넌트 트리 (generative-UI)
+
+| 데이터셋 | 라이센스 | 추정 토큰 | 생성 모델 | reasoning | 우선순위 |
+|---|---|---|---|---|---|
+| [nvidia/Nemotron-Instruction-Following-Chat-v1](https://huggingface.co/datasets/nvidia/Nemotron-Instruction-Following-Chat-v1) structured_outputs 서브셋 | CC-BY-4.0 | ~3M | **gpt-oss-120B + Qwen3-235B-Thinking/Instruct** | on/off 라벨 | **S** (유일 클린 JSON-schema 제약 출력) |
+| [Salesforce/xlam-function-calling-60k](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k) | CC-BY-4.0 | ~9M | DeepSeek-V2 + Mixtral-8x22B | No | B (tool→widget 구조 보조) |
+| [osunlp/Mind2Web](https://huggingface.co/datasets/osunlp/Mind2Web) text-only | CC-BY-4.0 | 소형(action repr) | 인간 어노테이션 | No | B (DOM 이해 보조, UI emit 아님) |
+| **자체 합성** JSON 컴포넌트 트리 / RSC spec | 자체 | ~1.8B | gpt-oss-120B/Qwen3/GLM-4.6 | `<think>` → 컴포넌트 트리 | **S** (공개 데이터 부재 → 필수 합성) |
+
+### 4.5.5 D. SVG / 차트 / data-viz spec
+
+| 데이터셋 | 라이센스 | 추정 토큰 | 생성 모델 | 우선순위 |
+|---|---|---|---|---|
+| [starvector/svg-stack](https://huggingface.co/datasets/starvector/svg-stack) | **카드 공란**(GitHub Apache-2.0) — 확정 전 보류 | 2.28M행 text-only SVG | 인간/크롤 | A조건부 (라이센스 확정 시) |
+| [TIGER-Lab/VisCode-Multi-679K](https://huggingface.co/datasets/TIGER-Lab/VisCode-Multi-679K) Vega-Lite·Mermaid·SVG 서브셋 | apache-2.0 | 코드만 추출 시 수십M | 코드=오픈소스 스크랩 / **지시문=GPT-4.1(플래그)** | A (코드 출력 위주, 지시문 대량 사용 회피) |
+| [mizanurr/Text2Vis](https://huggingface.co/datasets/mizanurr/Text2Vis) | MIT | ~1M | 비공개(arXiv 2507.19969) | A (matplotlib, **난이도 라벨**이 hybrid 라우팅에 유용) |
+
+### 4.5.6 거부 목록 (GenUI)
+
+| 데이터셋 | 라이센스 | 거부 사유 |
+|---|---|---|
+| [MBZUAI/Web2Code](https://huggingface.co/datasets/MBZUAI/Web2Code) | research-only / CC-BY-4.0 NC | **비상업 + GPT-3.5/GPT-4 생성** (이중 거부). 단 eval split은 decontam 대상 |
+| [smirki/React-Reasoning](https://huggingface.co/datasets/smirki/React-Reasoning) | — | **claude-3-5-sonnet + o1 생성** (closed-source distill) |
+| [iamdyeus/ui-instruct-4k](https://huggingface.co/datasets/iamdyeus/ui-instruct-4k) | apache-2.0 | **Claude Opus 4.6 + GPT-5 distill** + 라이브러리 역공학 리스크 |
+| [xingxm/SVGX-SFT-1M](https://huggingface.co/datasets/xingxm/SVGX-SFT-1M) | CC-BY-NC-4.0 | **비상업** |
+| [dataunitylab/json-schema](https://huggingface.co/datasets/dataunitylab/json-schema) | unknown | 라이센스 불명(허용목록 외) |
+| [paraloq/json_data_extraction](https://huggingface.co/datasets/paraloq/json_data_extraction) | apache-2.0 | **Gemini-Pro 생성** + 추출 태스크(UI 아님) |
+| `mrtoy/mobile-ui-design`, `YashJain/UI-Elements-Detection`, `zhourax977/VEGA`, `Tesslate/UIGEN-T3-14B*`(모델) | 다양 | vision/UI-detection 또는 모델 research-only |
+
+### 4.5.7 자체 합성 계획 (GenUI 필수 투자)
+
+> **상세 계획서**: `genui_synthesis_plan.md` (2026-05-28) — 출력형식 표준화(3 캐논 + `genui/v1` 트리), 중간 GPU teacher 선정, 시드→생성→실행기반 검증 캐스케이드(8단계)→reasoning trace→dedup/decontam→self-training, 토큰 예산 매핑, Phase 롤아웃.
+
+공개 클린 데이터로는 ~700-800M에 그치므로, GenUI 도메인의 다수는 자체 합성으로 채움:
+- **컴포넌트 트리 / RSC spec (C, ~1.8B)**: gpt-oss-120B/Qwen3/GLM-4.6로 "자연어 요구 → `<think>` 설계 → JSON 컴포넌트 트리/props" 생성. 진짜 generative-UI 공개 데이터 부재를 메움.
+- **reasoning UI (B, ~1B)**: 동일 teacher로 레이아웃/접근성(a11y)/반응형/상태관리 추론 → 코드. **명시적 `reasoning: on/off` 라벨**로 hybrid toggle 직접 제어 (Tesslate teacher 미검증 리스크 회피).
+- **한국어 UI 보너스**: 기성 한국어 GenUI 데이터는 부재. Qwen/DeepSeek/GLM/gpt-oss로 한국어 프롬프트→UI 코드 소량 합성.
+- **Java/Kotlin·SwiftUI 등 비-web UI**(선택): 필요 시 동일 파이프라인.
+
+### 4.5.8 GenUI teacher 다양성
+
+WebSight(Mistral+DeepSeek-Coder-33B) / WebGen(DeepSeek-V3) / Nemotron-structured(gpt-oss-120B+Qwen3) / Tessa-T1(Qwen2.5-Coder) / 자체합성(gpt-oss-120B·Qwen3·GLM-4.6)으로 분산 → §1.3 단일 teacher ≤50% 캡 준수. Tesslate(비공개)는 검증 후에만 카운트.
+
+---
+
 ## 5. 거대 데이터셋 Split 라우팅
 
 같은 데이터셋이 여러 도메인에 걸치는 경우 split-level로 분배:
@@ -269,8 +376,9 @@
 | [interstellarninja/hermes_reasoning_tool_use](https://huggingface.co/datasets/interstellarninja/hermes_reasoning_tool_use) | reasoning + tool 결합 — Agent와 reasoning을 잇는 다리 |
 | [HuggingFaceTB/smoltalk2](https://huggingface.co/datasets/HuggingFaceTB/smoltalk2) multi-turn-reasoning-if-think | reasoning + IF 결합 |
 | OpenCodeInstruct (non-thinking) + OpenCodeReasoning-2 (long-CoT) | 코드 thinking/non-thinking balance |
+| **GenUI**: Tesslate UIGEN-T3-Extended(2단 reasoning, teacher 검증 후) + 자체 합성 reasoning UI(`reasoning: on/off` 라벨) | UI 생성 toggle — 단순 컴포넌트는 직접 생성, 복잡 레이아웃/상태관리는 long-think (§4.5.3) |
 
-**Hybrid 학습 권장 mix**: thinking 70% / non-thinking 30%. 명시적 `reasoning: on/off` 라벨링하여 학습.
+**Hybrid 학습 권장 mix**: thinking 70% / non-thinking 30%. 명시적 `reasoning: on/off` 라벨링하여 학습. GenUI도 동일 — 단순 UI(버튼/카드)는 non-thinking, 복잡 UI(대시보드/폼 검증/반응형)는 thinking.
 
 ---
 
@@ -283,11 +391,21 @@
 - **논리**: GLM-5.1-Reasoning-1M-Cleaned, Nemotron-Post-Training-v1/v2 toggle, Llama-Nemotron-PT(필터), OpenThoughts3 puzzle, YiSang-HQ
 - **Agent**: Toucan-1.5M, Nemotron tool-calling split, ToolACE, hermes_reasoning_tool_use
 - **IF**: Nemotron-RL-IF, VerInstruct, Tulu3-personas-IF, RLVR-IFeval, Dolci-Instruct-SFT Precise, smoltalk2 multi-turn-if-think, Magpie-Qwen2.5-Pro-300K
+- **GenUI**: Tessa-T1, WebSight(text-side, cap 0.5B), WebGen-Instruct(eval 분리), Nemotron structured_outputs, VisCode UI 서브셋 — 그리고 자체 합성(C/B)
 
 ### 8.2 Llama 출력 필터링 (필수)
 - `nvidia/Llama-Nemotron-PT`: `generator == "Llama-3.3-70B-Instruct"` 행 ~420k 제외
 - `argilla/Synth-APIGen-v0.1`: Llama-3.1 부분 25.7k 제외, Qwen 17.7k만 사용
 - `HuggingFaceTB/smoltalk2`: Smol-Magpie-Ultra (Llama-3.1-405B) split 제외
+- `cfahlgren1/react-code-instructions`: `model` 컬럼으로 Llama-3.1-70B/405B 행 제외, DeepSeek-V3 + Qwen2.5-Coder-32B 행만 사용
+
+### 8.8 GenUI 도메인 (신규, §4.5)
+- **Tesslate/smirki teacher 검증**: ~300-400M 토큰의 채택 여부를 가르는 단일 최대 변수. GitHub/HF discussion으로 teacher 모델 문의 → Llama/closed-source면 거부, Qwen/DeepSeek/GLM/gpt-oss면 S 승격. 검증 전까지 자체 합성으로 대체.
+- **자체 합성(필수)**: 컴포넌트 트리/RSC spec ~1.8B + reasoning UI ~1B + 한국어 UI 소량. gpt-oss-120B/Qwen3/GLM-4.6로 `<think>`→코드/JSON, 명시적 `reasoning: on/off` 라벨.
+- **`starvector/svg-stack` 라이센스 확정**: 카드 공란 → 작성자 확인 후 채택(SVG D 도메인).
+- **`TIGER-Lab/VisCode-Multi-679K`**: `language` 컬럼으로 Vega-Lite/SVG/Mermaid/HTML만 추출, GPT-4.1 지시문은 대량 사용 회피(코드 출력 위주 또는 Qwen/GLM 재라벨).
+- **web pretrain corpus(the-stack-v2/stack-edu/github-code)**: permissive 라이센스만 필터 + SoftwareHeritage 동의 + attribution, 강한 cap(web 총 ~3B).
+- **GenUI decontam**: §1.4 GenUI/Web 평가셋(WebDev Arena 최우선) 차단.
 
 ### 8.3 Decontamination (§1.4 평가셋 목록 적용)
 datatrove + open-r1 decontamination 스크립트로 8-gram + fuzzy 0.8 매칭 차단.
@@ -321,12 +439,14 @@ datatrove + Gemma4 토크나이저로 실제 토큰 측정. 본 보고서 추정
 
 **최종 모델 라이센스 권고**: 상업 사용 가능, **attribution 의무 명시** (NVIDIA Nemotron 데이터 사용 사실 표기).
 
+> **GenUI ~10B 추가 영향 (2026-05-28)**: WebSight·Nemotron-structured·VisCode(CC-BY-4.0) + Tessa/자체합성(Apache-2.0) + WebGen(MIT) 조합으로 위 분포를 크게 바꾸지 않음. 단 the-stack-v2/github-code permissive 코드를 쓰면 **파일별 원 라이센스 attribution**과 SoftwareHeritage 동의 의무가 추가됨.
+
 ---
 
 ## 부록 A. 거부 데이터셋 (핵심 65개+)
 
 ### A.1 CC-BY-NC / NC-SA / NC-ND (비상업)
-KodCode 전 시리즈, AM-DeepSeek-R1-Distilled 전 시리즈, facebook/natural_reasoning, MegaScience, TextbookReasoning, SCP-116K, WebInstructFull, AceMath-Instruct-Training-Data, ServiceNow R1-Distill-SFT, Camel-AI 전 시리즈, ChemPile 전 시리즈, GAIR/lima, no_robots, BAAI/Infinity-Instruct, PersonaHub, allenai/sciq, ai2_arc, ScienceQA, mgsm, Salesforce/APIGen-MT-5k
+KodCode 전 시리즈, AM-DeepSeek-R1-Distilled 전 시리즈, facebook/natural_reasoning, MegaScience, TextbookReasoning, SCP-116K, WebInstructFull, AceMath-Instruct-Training-Data, ServiceNow R1-Distill-SFT, Camel-AI 전 시리즈, ChemPile 전 시리즈, GAIR/lima, no_robots, BAAI/Infinity-Instruct, PersonaHub, allenai/sciq, ai2_arc, ScienceQA, mgsm, Salesforce/APIGen-MT-5k, **xingxm/SVGX-SFT-1M(GenUI, CC-BY-NC)**, **MBZUAI/Web2Code(GenUI, NC + GPT 생성)**
 
 ### A.2 Llama 출력 합성
 argilla/magpie-ultra-v1.0/v0.1, FinePersonas, Llama-3-Magpie-Pro 시리즈, Magpie-Llama-3.1-Pro 시리즈, Magpie-Llama-3.3-Pro, Magpie-Reasoning-V2-Deepseek-R1-Llama-70B, HuggingFaceTB/smoltalk v1, smol-smoltalk, MathGenie/MathCode-Pile, DeepHermes-3 데이터, Reflection-Dataset-v2
@@ -335,7 +455,7 @@ argilla/magpie-ultra-v1.0/v0.1, FinePersonas, Llama-3-Magpie-Pro 시리즈, Magp
 gorilla-llm/Berkeley-Function-Calling-Leaderboard (BFCL test), google/IFEval, allenai/IFBench_test, TIGER-Lab/MMLU-Pro, TheoremQA, Idavidrein/gpqa, math-ai/aime24, MATH-500, OlympiadBench(eval), lab-bench, ChemBench, livecodebench, BigCodeBench, UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled, tau2-bench-data
 
 ### A.4 Closed-source distill (Scenario A 결정에 따라 거부)
-lordx64/reasoning-distill-opus-4-7-max-sft, Kassadin88/Claude-Distills, Crownelius/Opus-4.6-Reasoning-3300x, TeichAI/Claude-Sonnet-4.6-Reasoning-1100x, Nettoov/Gpt-5.4-Xhigh-Reasoning-2000x, TeichAI/gemini-3-pro-preview-high-reasoning-1000x, TeichAI/grok-code-fast-1-1000x
+lordx64/reasoning-distill-opus-4-7-max-sft, Kassadin88/Claude-Distills, Crownelius/Opus-4.6-Reasoning-3300x, TeichAI/Claude-Sonnet-4.6-Reasoning-1100x, Nettoov/Gpt-5.4-Xhigh-Reasoning-2000x, TeichAI/gemini-3-pro-preview-high-reasoning-1000x, TeichAI/grok-code-fast-1-1000x, **smirki/React-Reasoning(GenUI, claude-3-5-sonnet+o1)**, **iamdyeus/ui-instruct-4k(GenUI, Claude Opus 4.6+GPT-5)**, **paraloq/json_data_extraction(GenUI, Gemini-Pro)**
 
 ### A.5 기타
 hkust-nlp/agentboard (GPL-2.0), OpenHermes-2.5 (GPT-4 출력 + 라이센스 혼재), ShareGPT 전 시리즈 (OpenAI ToS)
