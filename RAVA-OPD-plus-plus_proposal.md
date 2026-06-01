@@ -54,7 +54,113 @@ VA-OPD (Liu et al., 2026-05) 의 명시적 한계 5종:
 
 ## 3. Method
 
+### 3.0 직관과 흐름 — 4개 mechanism 의 연결 구조
+
+#### 한 줄 요약
+> "Teacher 가 *이미지의 어느 region* 을 보고 답했는지 알아내고, 그 region attribution 이 *얼마나 믿을 만한지* 를 다중 perturbation 일치도로 정량화한 뒤, 신뢰도에 따라 student 한테 *얼마나 강하게* 그리고 *어떤 KL 방향으로* 가르칠지 region 별로 자동 결정한다."
+
+#### 푸는 문제 4단계와 각 단계의 mechanism
+VA-OPD 가 token-level logprob 차이 1개 신호에 의존했던 걸 region 단위로 풀고, 그 신호 자체의 신뢰도까지 같이 푸는 4단 파이프라인.
+
+| # | 풀려는 질문 | Mechanism | 핵심 수식 |
+|---|---|---|---|
+| Q1 | Teacher 가 이미지 *어디* 를 보고 답했나? | **RA-KL** (§3.1) | $A_T^{(k)}(i,j) = -\|\delta\log p\|$ |
+| Q2 | 그 attribution 을 *믿어도 되나?* | **CV-RC** (§3.2) | $C(i,j) = 1 - \text{Var}_k / \text{Var}_{\max}$ |
+| Q3 | 믿을 만한 region 만 *골라서* 가르치자 | **CW-AKL** (§3.2, §3.4) | $L = \lambda \sum C_{\text{eff}} \cdot L^{\text{KL}}$ |
+| Q4 | 신뢰도에 따라 *KL 방향* 도 다르게 | **RA-KLD** (§3.3) | $C_{\text{eff}}$ 구간별 F-KL / R-KL / 0 |
+
+#### 왜 이 4단계가 필요한가 (각 단계의 *없으면 무슨 일이 생기나*)
+
+- **Q1 만 있을 때** (region attribution 만): 어떤 region attribution 이든 teacher 자신의 systematic bias 를 포함 — Bilodeau 2024 impossibility 가 정확히 이 경우. → Q2 필요.
+- **Q1+Q2 만 있을 때** (consistency 만 측정): 측정만 하고 학습 신호에 못 반영. → Q3 필요.
+- **Q1+Q2+Q3 만 있을 때** (CW-AKL 까지): 모든 region 에 *같은 방향의* KL (보통 forward) 을 걸어버림. 중간 신뢰도 region 에서 student 가 teacher 의 noisy 분포까지 covering 하려다 hallucination 증가. → Q4 (KL geometry switching) 필요.
+
+#### 왜 KL 방향을 region 별로 바꾸나 (Q4 의 mechanism intuition)
+Forward KL $D(\pi^T \| \pi^S)$ 는 "teacher 가 mass 둔 곳은 student 도 다 cover" (mass-covering, mean-seeking). Reverse KL $D(\pi^S \| \pi^T)$ 는 "student 가 mass 둔 곳은 반드시 teacher 도 mass" (mode-seeking, zero-avoiding).
+- High-C region (consistency 높음 = 여러 perturbation 이 같은 region 을 가리킴): teacher 의 attention 분포가 noise 가 아니므로 student 가 전체 분포를 따라가야 함 → **forward KL**.
+- Mid-C region (consistency 중간): teacher 분포에 noise 가 섞여 있을 가능성. student 가 covering 하면 noise 까지 학습 → mode 만 잡아내는 **reverse KL** 이 안전.
+- Low-C region (consistency 낮음 = perturbation 마다 다른 region): attribution 자체가 unreliable → **gradient 0**, 학습 신호 제거.
+
+#### 데이터 흐름도 (1 batch 의 1 image 처리)
+```
+v (image) ── K=3 perturbation ─→ {T_blur(v), T_grid(v), T_swap(v)}
+                                     │
+                                     ▼
+                      teacher π^T 4회 forward
+                  (원본 + 3 perturbation 각 grid cell)
+                                     │
+                                     ▼
+                  per-cell attribution A_T^(k)(i,j)   ← §3.1 RA-KL
+                                     │
+                                     ▼
+              normalize per k → cross-view variance
+                                     │
+                                     ▼
+                  consistency C(i,j) ∈ [0,1]          ← §3.2 CV-RC
+                                     │
+                  magnitude floor (배경 차단)
+                                     │
+                                     ▼
+                       C_eff(i,j)
+                       │       │       │
+              C≥τ_high  τ_low<C<τ_high  C≤τ_low
+                  │           │             │
+              F-KL        R-KL          gradient 0   ← §3.3 RA-KLD
+                  └─────┬─────┘
+                         ▼
+              L = L_OPD_base + λ · Σ C_eff · L^KL    ← §3.4 full obj
+```
+
+#### 기존 방법 대비 — 한 줄로 풀어 쓴 차이
+
+가장 가까운 prior 5종이 *각각 무엇을 했고, 어디서 막혔고, 본 연구가 어떻게 그 막힌 지점을 푸나*.
+
+**(1) VA-OPD (원논문, arxiv 2605.21924)**
+- 무엇을: token 마다 "teacher 가 이미지 봤을 때 vs 안 봤을 때" logprob 차이 = visual advantage scalar. 그 값으로 token 을 high/low 두 그룹 binary 분류해서 KL 가중치 다르게.
+- 막힌 곳: ① 신호가 token 단위라 *어디* 가 중요한지는 영영 모름 (logprob 은 어디 봤는지를 알려주지 않음). ② Binary 그룹화 — 신뢰도 정보 0. ③ Teacher 1명의 calibration 에 통째 의존, validation 메커니즘 없음.
+- 본 연구의 풀이: 신호 locus 를 token → *region* 으로 옮겨서 ①을 해결, K=3 perturbation 의 cross-view consistency 로 ②③ 을 동시에 해결.
+
+**(2) PGPO (2604.01840) / VPPO (2510.09285) / PAPO (2507.06448) — ICLR 2026 accepted token reweighting 3종**
+- 무엇을: 모두 token-level RL gradient 의 weighting space 에서 visual signal 을 활용. token 별 advantage 또는 importance 를 visual feature 로 재가중.
+- 막힌 곳: 같은 token-reweighting 공간 안에서 변형은 trivial composition (PGPO의 visual gating × VPPO의 percept reweight 등) 으로 매번 만들 수 있어 ICLR 2027 시점엔 *공간 포화*. R1 mock review 의 핵심 reject 사유.
+- 본 연구의 풀이: 그 공간에 안 들어감. signal 을 token 이 아닌 *region* 에 두고, 가중치 변경이 아닌 *KL 방향 변경* 이 핵심 mechanism. axis 자체가 다름.
+
+**(3) Entropy-Aware OPD (2603.07079) — token-level F/R-KL switching**
+- 무엇을: token entropy 가 높으면 reverse KL, 낮으면 forward KL 로 *token 단위* 자동 전환.
+- 막힌 곳: 전환 trigger 가 entropy 한 가지 — *distribution sharpness* 신호. teacher 분포가 sharp 한데 실은 systematic bias 일 수도 있음 (sharp = reliable 가정의 약점).
+- 본 연구의 풀이: 전환 trigger 를 entropy 가 아닌 *cross-view consistency* 로. 다중 perturbation 일치도는 entropy 와 정보론적으로 직교 (perturbation invariance ⊥ distribution sharpness, Spearman ρ<0.5 검증 예정). 그리고 전환 단위가 token 이 아닌 *region*. 즉 axis 2개 (trigger + granularity) 모두 다름.
+
+**(4) Beta-KD (2603.21426, CVPR 2026) — calibration-aware KL**
+- 무엇을: KL term 자체에 Bayesian Gibbs prior 를 박아 teacher 의 over-confidence 보정. Off-policy distillation.
+- 막힌 곳: 보정이 KL term 의 *내부* (single term) 에서 일어남. 어느 영역에 신뢰 / 불신을 둘지는 모름. Off-policy.
+- 본 연구의 풀이: 보정을 KL term 의 *적용 여부 / 방향* 에서 함 — region 별 신뢰도가 KL 의 *외부 결정 변수*. On-policy.
+
+**(5) Visual attention KL 계열 (RAL / CompoDistill / Zagoruyko 2017)**
+- 무엇을: teacher 의 raw attention map 을 student 가 그대로 따라가게 KL 또는 MSE.
+- 막힌 곳: raw attention 의 reliability 검증 없음. teacher attention 의 spurious 부분까지 student 가 학습 (Adebayo 2018 sanity check 실패 위험).
+- 본 연구의 풀이: raw attention 을 안 씀. *teacher logprob 기반 attribution* (functional importance) → *cross-view consistency 로 reliability 검증* → 검증 통과한 region 에만 KL.
+
+#### Mechanism axis 표 — 어디가 비어있었나
+
+| 방법 | Signal locus | Signal granularity | Weight type | KL direction |
+|---|---|---|---|---|
+| VA-OPD | token logprob | scalar | binary | fixed |
+| PGPO/VPPO/PAPO | token | continuous | continuous | fixed |
+| Entropy-Aware OPD | token entropy | continuous | none | F/R switch |
+| Beta-KD | KL prior | continuous | continuous | fixed |
+| Raw Attention KL | region attn | continuous | uniform | fixed |
+| **RAVA-OPD++** | **region logprob** | **continuous** | **consistency-weighted** | **F/R/0 by region** |
+
+마지막 행의 4 cell 조합은 ICLR 2027 시점 prior 에 없는 cell — R5 9-키워드 overlap hunt 에서 direct overlap 0 으로 확인.
+
+#### 1줄로 압축
+> VA-OPD 는 token 마다 (advantage scalar, fixed-direction KL). RAVA-OPD++ 는 region 마다 *(magnitude, reliability, direction)* 의 3-tuple. token reweighting 공간 (PGPO/VPPO/PAPO) 과 token F/R-KL switching 공간 (Entropy-Aware OPD) 양쪽 prior 에서 동시에 빠져나오는 mechanism shift.
+
+---
+
 ### 3.1 Region attribution from teacher perturbation
+
+**푸는 질문**: Q1 — *teacher 가 이미지 어디를 보고 답했는가?*. Token logprob 차이를 grid-cell 별로 환원해 spatial attribution map 으로 변환.
 
 K=3 perturbation operator: $T = \{T_{\text{blur}}, T_{\text{grid-mask}}, T_{\text{semantic-swap}}\}$.
 
@@ -63,6 +169,8 @@ $$A_T^{(k)}(i,j) = -\Big|\, \log \pi^T(y | v) - \log \pi^T(y | T_k(v; i,j)) \,\B
 where $T_k(v; i,j)$ 는 grid cell $(i,j)$ 만 perturb 한 이미지.
 
 ### 3.2 Cross-View Region Consistency (CV-RC)
+
+**푸는 질문**: Q2 — *§3.1 의 attribution 을 믿어도 되나?*. 같은 region 이 *서로 다른 방식의* perturbation 하에서도 강한 logprob drop 을 일으키면 그 region 의 importance 는 robust. 단일 perturbation 의 systematic bias (예: grid-mask 의 hard-edge artifact) 가 attribution 을 가짜로 키워도 다른 perturbation 이 동의하지 않으면 걸러짐.
 
 $$C(i,j) = 1 - \frac{\text{Var}_k \, \tilde{A}_T^{(k)}(i,j)}{\text{Var}_{\max}}$$
 
@@ -74,6 +182,8 @@ $$C_{\text{eff}}(i,j) = C(i,j) \cdot \mathbf{1}\!\left[\,\frac{1}{K}\sum_k |\del
 흰 배경 / 빈 영역(variance≈0 → 인공적으로 C=1) 을 차단.
 
 ### 3.3 Region-Adaptive KL Direction (RA-KLD)
+
+**푸는 질문**: Q4 — *region 별 신뢰도에 따라 KL geometry 자체를 바꾸자.* high-C 는 forward, mid-C 는 reverse, low-C 는 학습 신호 차단. KL 방향이 region 단위로 *분포 자체에 의해 결정* 되는 것이 본 연구의 mechanism-level novelty.
 
 Region $(i,j)$ 의 region attention KL term $L^{\text{KL}}_{i,j}$ 을 $C_{\text{eff}}$ 값에 따라 다음과 같이 정의:
 
